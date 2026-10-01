@@ -1,0 +1,30 @@
+# Paths are relative to this YAML file, not the launching terminal.
+# Create ./work before starting fev; ./state is created automatically.
+settle: 200ms
+concurrency: 2
+state: ./state
+
+roots:
+  - id: example
+    path: ./work
+    rules:
+      # Weekly Report.txt -> Weekly Report.upper.txt; exclude generated files.
+      - id: uppercase
+        events: [created]
+        match: '^(?P<name>[^/.]+)\.txt$'
+        run:
+          - |
+            tr '[:lower:]' '[:upper:]' < "$FILE" > "${MATCH_NAME}.upper.txt"
+          - 'printf "Uppercased: %s\n" "$KEY"'
+
+      # The new file reaches this rule through OS notifications and settle.
+      - id: finish
+        events: [created]
+        match: '^(?P<name>[^/.]+)\.upper\.txt$'
+        run: 'cat "$FILE" > "${MATCH_NAME}.done.txt"'
+
+      # Also matches the original input; independent and outputless.
+      - id: observe
+        events: [created]
+        match: '^(?P<name>[^/.]+)\.txt$'
+        run: 'printf "Observed: %s\n" "$KEY"'

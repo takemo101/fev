@@ -19,6 +19,8 @@
 
 ランナーは YAML ファイルを1つ受け取る。`settle` と `concurrency` を省略したときは、それぞれ `2s` と `2` になる。
 
+YAML の作成手順、コピーして動かせるテンプレート、設定項目・運用上の注意は [YAML 作成スキル](skills/creating-fev-yaml/SKILL.md) を参照する。
+
 ```yaml
 settle: 2s
 concurrency: 2
