@@ -23,19 +23,39 @@ struct Settling {
     deadline: Instant,
 }
 #[derive(Default)]
-struct Slot {
-    settling: Option<Settling>,
+struct RuleState {
     ready: Option<Identity>,
     running: Option<Identity>,
     attempted: Option<Identity>,
+}
+#[derive(Default)]
+struct Slot {
+    settling: Option<Settling>,
+    observed: Option<Identity>,
+    rules: HashMap<usize, RuleState>,
+}
+impl Slot {
+    fn discard_pending(&mut self) {
+        self.settling = None;
+        self.observed = None;
+        for state in self.rules.values_mut() {
+            state.ready = None;
+        }
+    }
+}
+struct Job {
+    location: Location,
+    rule: usize,
+    input: Identity,
+    captures: Vec<(String, String)>,
 }
 enum Message {
     Watch(notify::Result<Event>),
     Finished {
         location: Location,
+        rule: usize,
         input: Identity,
-        out: String,
-        result: Result<Identity>,
+        result: Result<()>,
     },
     Stop,
 }
@@ -43,7 +63,7 @@ struct Scheduler {
     config: Arc<Config>,
     ledger: Ledger,
     slots: HashMap<Location, Slot>,
-    queue: VecDeque<Location>,
+    queue: VecDeque<Job>,
     active: usize,
     stopping: bool,
     tx: Sender<Message>,
@@ -131,15 +151,18 @@ impl Scheduler {
         if let Some(id) = model::identity(&self.config.roots[root].path, key)? {
             self.settle(location, id);
         } else if let Some(slot) = self.slots.get_mut(&location) {
-            slot.settling = None;
-            slot.ready = None;
+            slot.discard_pending();
         }
         Ok(())
     }
 
     fn settle(&mut self, location: Location, id: Identity) {
         let slot = self.slots.entry(location).or_default();
-        if slot.running == Some(id) || slot.ready == Some(id) || slot.attempted == Some(id) {
+        if slot.observed == Some(id)
+            && slot.rules.values().all(|state| {
+                state.ready == Some(id) || state.running == Some(id) || state.attempted == Some(id)
+            })
+        {
             return;
         }
         match &mut slot.settling {
@@ -152,17 +175,31 @@ impl Scheduler {
             }
         }
         // A newer notification invalidates an older queued event, even before it settles.
-        slot.ready = None;
+        for state in slot.rules.values_mut() {
+            state.ready = None;
+        }
     }
 
     fn ready(&mut self, location: Location, id: Identity) {
         let slot = self.slots.entry(location.clone()).or_default();
-        if slot.attempted == Some(id) || slot.running == Some(id) {
-            return;
-        }
         slot.settling = None;
-        slot.ready = Some(id);
-        self.queue.push_back(location);
+        slot.observed = Some(id);
+        for (index, rule) in self.config.roots[location.0].rules.iter().enumerate() {
+            let Some(captures) = rule.environment(&location.1) else {
+                continue;
+            };
+            let state = slot.rules.entry(index).or_default();
+            if state.ready == Some(id) || state.attempted == Some(id) || state.running == Some(id) {
+                continue;
+            }
+            state.ready = Some(id);
+            self.queue.push_back(Job {
+                location: location.clone(),
+                rule: index,
+                input: id,
+                captures,
+            });
+        }
     }
 
     fn settle_due(&mut self) -> Result<()> {
@@ -186,8 +223,7 @@ impl Scheduler {
                 }
                 None => {
                     let slot = self.slots.get_mut(&location).unwrap();
-                    slot.settling = None;
-                    slot.ready = None;
+                    slot.discard_pending();
                 }
             }
         }
@@ -203,65 +239,69 @@ impl Scheduler {
             if self.active >= self.config.concurrency {
                 break;
             }
-            let Some(location) = self.queue.pop_front() else {
+            let Some(job) = self.queue.pop_front() else {
                 break;
             };
-            let slot = self.slots.get_mut(&location).unwrap();
-            if slot.running.is_some() {
-                if slot.ready.is_some() {
-                    self.queue.push_back(location);
-                }
+            let state = self
+                .slots
+                .get_mut(&job.location)
+                .unwrap()
+                .rules
+                .get_mut(&job.rule)
+                .unwrap();
+            if state.ready != Some(job.input) {
                 continue;
             }
-            let Some(id) = slot.ready.take() else {
+            if state.running.is_some() {
+                self.queue.push_back(job);
                 continue;
-            };
-            // A ready event can wait behind other jobs; do not run a stale version.
-            let current = model::identity(&self.config.roots[location.0].path, &location.1)?;
-            if current != Some(id) {
+            }
+            state.ready = None;
+            // Jobs can wait behind other rules; never run a stale input version.
+            let current =
+                model::identity(&self.config.roots[job.location.0].path, &job.location.1)?;
+            if current != Some(job.input) {
                 if let Some(current) = current {
-                    self.settle(location, current);
+                    self.settle(job.location, current);
+                } else {
+                    self.slots.get_mut(&job.location).unwrap().discard_pending();
                 }
                 continue;
             }
-            if slot.attempted == Some(id) {
+            if state.attempted == Some(job.input) {
                 continue;
             }
-            slot.attempted = Some(id);
-            let root = &self.config.roots[location.0];
-            if self.ledger.succeeded(&root.id, &location.1, id)? {
+            state.attempted = Some(job.input);
+            let root = &self.config.roots[job.location.0];
+            let rule = &root.rules[job.rule];
+            if self
+                .ledger
+                .succeeded(&root.id, &job.location.1, &rule.id, job.input)?
+            {
                 continue;
             }
-            let selected = match root.select(&location.1) {
-                Ok(selected) => selected,
-                Err(error) => {
-                    eprintln!("fev: {}/{}: {error:#}", root.id, location.1);
-                    continue;
-                }
-            };
-            let Some((rule, out)) = selected else {
-                continue;
-            };
-            let run = rule.run.clone();
-            eprintln!("fev: running {}/{} rule {}", root.id, location.1, rule.id);
-            slot.running = Some(id);
+            eprintln!(
+                "fev: running {}/{} rule {}",
+                root.id, job.location.1, rule.id
+            );
+            state.running = Some(job.input);
             self.active += 1;
             let config = self.config.clone();
             let tx = self.tx.clone();
             thread::Builder::new()
                 .name("fev-command".into())
                 .spawn(move || {
+                    let root = &config.roots[job.location.0];
                     let result = execution::execute(
-                        &config.roots[location.0].path,
-                        &config.state,
-                        &run,
-                        &location.1,
-                        &out,
+                        &root.path,
+                        &job.location.1,
+                        &root.rules[job.rule].run,
+                        &job.captures,
                     );
                     let _ = tx.send(Message::Finished {
-                        location,
-                        input: id,
-                        out,
+                        location: job.location,
+                        rule: job.rule,
+                        input: job.input,
                         result,
                     });
                 })
@@ -285,8 +325,7 @@ impl Scheduler {
                         .strip_prefix(key)
                         .is_some_and(|suffix| suffix.starts_with('/')))
             {
-                slot.settling = None;
-                slot.ready = None;
+                slot.discard_pending();
             }
         }
     }
@@ -370,22 +409,29 @@ impl Scheduler {
     fn finished(
         &mut self,
         location: Location,
+        rule_index: usize,
         input: Identity,
-        out: String,
-        result: Result<Identity>,
+        result: Result<()>,
     ) -> Result<()> {
         self.active -= 1;
-        self.slots.get_mut(&location).unwrap().running = None;
+        self.slots
+            .get_mut(&location)
+            .unwrap()
+            .rules
+            .get_mut(&rule_index)
+            .unwrap()
+            .running = None;
         let root = &self.config.roots[location.0];
+        let rule = &root.rules[rule_index];
         match result {
-            Ok(output_id) => {
-                self.ledger.record(&root.id, &location.1, input, &out)?;
-                eprintln!("fev: published {}/{}", root.id, out);
-                if !self.stopping {
-                    self.ready((location.0, out), output_id);
-                }
+            Ok(()) => {
+                self.ledger.record(&root.id, &location.1, &rule.id, input)?;
+                eprintln!("fev: completed {}/{} rule {}", root.id, location.1, rule.id);
             }
-            Err(error) => eprintln!("fev: failed {}/{}: {error:#}", root.id, location.1),
+            Err(error) => eprintln!(
+                "fev: failed {}/{} rule {}: {error:#}",
+                root.id, location.1, rule.id
+            ),
         }
         if !self.stopping
             && let Some(current) =
@@ -435,9 +481,9 @@ impl Scheduler {
                 Message::Finished {
                     location,
                     input,
-                    out,
+                    rule,
                     result,
-                } => self.finished(location, input, out, result)?,
+                } => self.finished(location, rule, input, result)?,
                 Message::Stop => {
                     self.stopping = true;
                     eprintln!("fev: stopping; waiting for {} command(s)", self.active);
@@ -454,7 +500,7 @@ mod regression_tests {
     use notify::event::{CreateKind, RemoveKind};
     use std::{fs, time::Duration};
 
-    fn fixture(settle: Duration) -> (tempfile::TempDir, Scheduler) {
+    pub(super) fn fixture(settle: Duration) -> (tempfile::TempDir, Scheduler) {
         let base = tempfile::tempdir().unwrap();
         let root = base.path().join("root");
         let state = base.path().join("state");
@@ -472,8 +518,8 @@ mod regression_tests {
                 rules: vec![Rule {
                     id: "copy".into(),
                     matcher: regex::Regex::new(r"^(?P<name>.+)\.txt$").unwrap(),
-                    run: "cat \"$FILE\" > \"$OUT_TMP\"".into(),
-                    out: "{name}.done".into(),
+                    run: vec!["cat \"$FILE\" > \"${MATCH_NAME}.done\"".into()],
+                    capture_env: vec![(1, "MATCH_NAME".into())],
                 }],
             }],
         });
@@ -492,18 +538,18 @@ mod regression_tests {
         )
     }
 
-    fn complete(scheduler: &mut Scheduler) {
+    pub(super) fn complete(scheduler: &mut Scheduler) {
         let message = scheduler.rx.recv_timeout(Duration::from_secs(3)).unwrap();
         let Message::Finished {
             location,
             input,
-            out,
+            rule,
             result,
         } = message
         else {
             panic!("unexpected message");
         };
-        scheduler.finished(location, input, out, result).unwrap();
+        scheduler.finished(location, rule, input, result).unwrap();
     }
 
     fn removal_restarts_settle(directory: bool) {
@@ -586,27 +632,85 @@ mod regression_tests {
             "valid"
         );
     }
+}
+
+#[cfg(test)]
+mod queued_rule_regression {
+    use super::*;
+    use crate::config::Rule;
+    use notify::event::RemoveKind;
+    use std::{fs, time::Duration};
+
+    fn queued_sibling() -> (tempfile::TempDir, Scheduler, std::path::PathBuf) {
+        let (base, mut scheduler) = super::regression_tests::fixture(Duration::ZERO);
+        let config = Arc::get_mut(&mut scheduler.config).unwrap();
+        config.concurrency = 1;
+        config.roots[0].rules.push(Rule {
+            id: "second".into(),
+            matcher: regex::Regex::new(r"^item\.txt$").unwrap(),
+            run: vec!["printf second > second.done".into()],
+            capture_env: Vec::new(),
+        });
+        let root = scheduler.config.roots[0].path.clone();
+        fs::write(root.join("item.txt"), "source").unwrap();
+        scheduler.path_event(0, &root.join("item.txt")).unwrap();
+        scheduler.settle_due().unwrap();
+        scheduler.dispatch().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !fs::read_to_string(root.join("item.done")).is_ok_and(|text| text == "source") {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        (base, scheduler, root)
+    }
+
+    fn finish_sibling(scheduler: &mut Scheduler, root: &Path) {
+        scheduler.path_event(0, &root.join("item.txt")).unwrap();
+        scheduler.settle_due().unwrap();
+        super::regression_tests::complete(scheduler);
+        scheduler.dispatch().unwrap();
+        assert_eq!(
+            scheduler.active, 1,
+            "queued sibling was lost after input restoration"
+        );
+        super::regression_tests::complete(scheduler);
+        assert_eq!(
+            fs::read_to_string(root.join("second.done")).unwrap(),
+            "second"
+        );
+    }
 
     #[test]
-    fn regression_duplicate_publication_preserves_newer_change() {
-        let (_base, mut scheduler) = fixture(Duration::ZERO);
-        let root = scheduler.config.roots[0].path.clone();
-        fs::write(root.join("item.txt"), "old").unwrap();
-        let old = model::identity(&root, "item.txt").unwrap().unwrap();
-        scheduler.path_event(0, &root.join("item.txt")).unwrap();
-        scheduler.settle_due().unwrap();
-        scheduler.dispatch().unwrap();
-        complete(&mut scheduler);
-        fs::write(root.join("item.txt"), "new content").unwrap();
-        scheduler.path_event(0, &root.join("item.txt")).unwrap();
-        scheduler.ready((0, "item.txt".into()), old);
-        scheduler.settle_due().unwrap();
-        scheduler.dispatch().unwrap();
-        assert_eq!(scheduler.active, 1, "newer external change was lost");
-        complete(&mut scheduler);
-        assert_eq!(
-            fs::read_to_string(root.join("item.done")).unwrap(),
-            "new content"
-        );
+    fn restoring_unchanged_input_preserves_unattempted_sibling() {
+        let (base, mut scheduler, root) = queued_sibling();
+        let original = model::identity(&root, "item.txt").unwrap();
+        fs::rename(root.join("item.txt"), base.path().join("away")).unwrap();
+        scheduler
+            .notification(
+                Event::new(EventKind::Remove(RemoveKind::File)).add_path(root.join("item.txt")),
+            )
+            .unwrap();
+        fs::rename(base.path().join("away"), root.join("item.txt")).unwrap();
+        assert_eq!(model::identity(&root, "item.txt").unwrap(), original);
+        finish_sibling(&mut scheduler, &root);
+    }
+
+    #[test]
+    fn reverting_modification_preserves_unattempted_sibling() {
+        let (_base, mut scheduler, root) = queued_sibling();
+        let path = root.join("item.txt");
+        let original = model::identity(&root, "item.txt").unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, "changed input").unwrap();
+        scheduler.path_event(0, &path).unwrap();
+        fs::write(&path, "source").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(model::identity(&root, "item.txt").unwrap(), original);
+        finish_sibling(&mut scheduler, &root);
     }
 }
