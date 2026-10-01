@@ -21,6 +21,23 @@ pub fn identity(root: &Path, key: &str) -> Result<Option<Identity>> {
     if !valid_key(key) {
         bail!("invalid key: {key:?}");
     }
+    let root_metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading root {}", root.display()));
+        }
+    };
+    if !root_metadata.is_dir() {
+        return Ok(None);
+    }
     let mut path = root.to_path_buf();
     let mut components = key.split('/').peekable();
     while let Some(component) = components.next() {
@@ -70,6 +87,11 @@ mod tests {
         assert!(!valid_key("a/../input"));
         assert!(!valid_key("/input"));
         assert!(!valid_key("a/./input"));
+
+        let replaced = outside.path().join("replaced-root");
+        symlink(root.path(), &replaced).unwrap();
+        std::fs::write(root.path().join("input"), "inside").unwrap();
+        assert!(identity(&replaced, "input").unwrap().is_none());
     }
 
     #[test]

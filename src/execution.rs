@@ -1,10 +1,7 @@
 use crate::model::{Identity, identity, valid_key};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, params};
-use std::ffi::CString;
-use std::fs::{self, File};
-use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -18,51 +15,76 @@ impl Ledger {
     pub fn open(state: &Path) -> Result<Self> {
         fs::create_dir_all(state)
             .with_context(|| format!("creating state directory {}", state.display()))?;
-        let connection =
+        let mut connection =
             Connection::open(state.join("ledger.sqlite3")).context("opening success ledger")?;
-        connection.execute_batch(
+        let transaction = connection
+            .transaction()
+            .context("starting ledger migration")?;
+        let legacy: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'successes')
+                AND NOT EXISTS(SELECT 1 FROM pragma_table_info('successes') WHERE name = 'rule_id')",
+            [],
+            |row| row.get(0),
+        )?;
+        if legacy {
+            // Old successes have no rule identity and cannot suppress current jobs.
+            // A conflicting archive makes ALTER fail, preserving both tables.
+            transaction
+                .execute_batch("ALTER TABLE successes RENAME TO legacy_successes;")
+                .context("archiving legacy success ledger")?;
+        }
+        transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS successes (
                 root_id TEXT NOT NULL,
                 key TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
                 size TEXT NOT NULL,
                 modified_ns TEXT NOT NULL,
-                out_key TEXT NOT NULL,
                 succeeded_ns TEXT NOT NULL,
-                PRIMARY KEY (root_id, key, size, modified_ns)
+                PRIMARY KEY (root_id, key, rule_id, size, modified_ns)
             ) WITHOUT ROWID;",
         )?;
+        transaction
+            .commit()
+            .context("committing ledger migration")?;
         Ok(Self { connection })
     }
 
-    pub fn succeeded(&self, root: &str, key: &str, id: Identity) -> Result<bool> {
+    pub fn succeeded(&self, root: &str, key: &str, rule: &str, id: Identity) -> Result<bool> {
         let mut statement = self.connection.prepare_cached(
             "SELECT EXISTS(
                 SELECT 1 FROM successes
-                WHERE root_id = ?1 AND key = ?2 AND size = ?3 AND modified_ns = ?4
+                WHERE root_id = ?1 AND key = ?2 AND rule_id = ?3 AND size = ?4 AND modified_ns = ?5
             )",
         )?;
         Ok(statement.query_row(
-            params![root, key, id.size.to_string(), id.modified_ns.to_string()],
+            params![
+                root,
+                key,
+                rule,
+                id.size.to_string(),
+                id.modified_ns.to_string()
+            ],
             |row| row.get(0),
         )?)
     }
 
-    pub fn record(&self, root: &str, key: &str, id: Identity, out: &str) -> Result<()> {
+    pub fn record(&self, root: &str, key: &str, rule: &str, id: Identity) -> Result<()> {
         let succeeded_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system clock precedes Unix epoch")?
             .as_nanos()
             .to_string();
         self.connection.execute(
-            "INSERT INTO successes (root_id, key, size, modified_ns, out_key, succeeded_ns)
+            "INSERT INTO successes (root_id, key, rule_id, size, modified_ns, succeeded_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT (root_id, key, size, modified_ns) DO NOTHING",
+             ON CONFLICT (root_id, key, rule_id, size, modified_ns) DO NOTHING",
             params![
                 root,
                 key,
+                rule,
                 id.size.to_string(),
                 id.modified_ns.to_string(),
-                out,
                 succeeded_ns
             ],
         )?;
@@ -70,168 +92,44 @@ impl Ledger {
     }
 }
 
-pub fn execute(root: &Path, state: &Path, run: &str, key: &str, out: &str) -> Result<Identity> {
+pub fn execute(
+    root: &Path,
+    key: &str,
+    run: &[String],
+    captures: &[(String, String)],
+) -> Result<()> {
     ensure!(valid_key(key), "unsafe input key: {key}");
-    ensure!(
-        valid_key(out) && !out.contains(".."),
-        "unsafe output key: {out}"
-    );
-    let root_directory =
-        open_directory_at(libc::AT_FDCWD, &path_string(root)?).with_context(|| {
-            format!(
-                "opening root without following symlinks: {}",
-                root.display()
-            )
-        })?;
     ensure!(
         identity(root, key)?.is_some(),
         "input is not an existing regular file: {key}"
     );
-
-    let canonical_root = root.canonicalize().context("resolving root directory")?;
-    let canonical_state = state.canonicalize().context("resolving state directory")?;
-    ensure!(
-        !canonical_state.starts_with(&canonical_root),
-        "temporary output state must be outside root"
-    );
-    // A new child cannot coincide with an existing root when state is its ancestor.
-    let temporary = tempfile::Builder::new()
-        .prefix(".fev-execution-")
-        .tempdir_in(&canonical_state)
-        .context("creating temporary output directory")?;
-    ensure!(
-        !temporary.path().starts_with(&canonical_root),
-        "temporary output directory must be outside root"
-    );
-    let temporary_directory = open_directory_at(libc::AT_FDCWD, &path_string(temporary.path())?)?;
-    let temporary_output = temporary.path().join("output");
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(run)
-        .current_dir(root)
-        .env("ROOT", root)
-        .env("KEY", key)
-        .env("FILE", root.join(key))
-        .env("OUT_TMP", &temporary_output)
-        .env("OUT", out)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("running command with sh -c")?;
-    ensure!(status.success(), "command failed with {status}");
-
-    let temporary_name = CString::new("output")?;
-    // Checking metadata does not require read permission on the output file.
-    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let found = unsafe {
-        libc::fstatat(
-            temporary_directory.as_raw_fd(),
-            temporary_name.as_ptr(),
-            metadata.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if found != 0 {
-        return Err(io::Error::last_os_error()).context("reading temporary output metadata");
-    }
-    // Successful fstatat initialized the complete value.
-    let metadata = unsafe { metadata.assume_init() };
-    ensure!(
-        metadata.st_mode & libc::S_IFMT == libc::S_IFREG,
-        "temporary output is not a regular, non-symlink file"
-    );
-
-    let mut components = out.split('/').peekable();
-    let mut parent = root_directory;
-    let destination = loop {
-        let component = components.next().context("empty output key")?;
-        let name = CString::new(component)?;
-        if components.peek().is_none() {
-            break name;
+    let inherited_captures: Vec<_> = std::env::vars_os()
+        .filter_map(|(name, _)| name.as_bytes().starts_with(b"MATCH_").then_some(name))
+        .collect();
+    let input = root.join(key);
+    for (index, run) in run.iter().enumerate() {
+        let step = index + 1;
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(run)
+            .current_dir(root)
+            .env_remove("OUT")
+            .env_remove("OUT_TMP");
+        for name in &inherited_captures {
+            command.env_remove(name);
         }
-        parent = create_directory_at(&parent, &name)
-            .with_context(|| format!("opening safe output directory component {component}"))?;
-    };
-    reject_unsafe_destination(&parent, &destination)?;
-    // Both ends are anchored to owned directory descriptors. renameat replaces a
-    // regular destination atomically without following any destination symlink.
-    let renamed = unsafe {
-        libc::renameat(
-            temporary_directory.as_raw_fd(),
-            temporary_name.as_ptr(),
-            parent.as_raw_fd(),
-            destination.as_ptr(),
-        )
-    };
-    if renamed != 0 {
-        return Err(io::Error::last_os_error()).context("atomically publishing output");
-    }
-    Ok(Identity {
-        size: u64::try_from(metadata.st_size).context("negative output size")?,
-        modified_ns: i128::from(metadata.st_mtime) * 1_000_000_000
-            + i128::from(metadata.st_mtime_nsec),
-    })
-}
-
-fn path_string(path: &Path) -> Result<CString> {
-    // Component reconstruction removes a trailing slash, which otherwise lets
-    // some kernels follow a final symlink despite O_NOFOLLOW.
-    let normalized: std::path::PathBuf = path.components().collect();
-    Ok(CString::new(normalized.as_os_str().as_bytes())?)
-}
-
-fn open_at(directory: RawFd, path: &CString, flags: libc::c_int) -> Result<File> {
-    // No O_CREAT is used here, so openat does not require a mode argument.
-    let descriptor = unsafe { libc::openat(directory, path.as_ptr(), flags) };
-    if descriptor < 0 {
-        return Err(io::Error::last_os_error()).context("opening file descriptor");
-    }
-    // A successful openat returns a new descriptor owned exclusively here.
-    Ok(unsafe { File::from_raw_fd(descriptor) })
-}
-
-fn open_directory_at(directory: RawFd, path: &CString) -> Result<File> {
-    open_at(
-        directory,
-        path,
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-    )
-}
-
-fn create_directory_at(parent: &File, component: &CString) -> Result<File> {
-    let created = unsafe { libc::mkdirat(parent.as_raw_fd(), component.as_ptr(), 0o755) };
-    if created != 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::AlreadyExists {
-            return Err(error).context("creating output parent directory");
-        }
-    }
-    open_directory_at(parent.as_raw_fd(), component)
-}
-
-fn reject_unsafe_destination(parent: &File, name: &CString) -> Result<()> {
-    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let found = unsafe {
-        libc::fstatat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            metadata.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if found != 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::NotFound {
-            return Ok(());
-        }
-        return Err(error).context("checking existing publication destination");
-    }
-    // fstatat initialized the stat value on its successful return.
-    let metadata = unsafe { metadata.assume_init() };
-    let kind = metadata.st_mode & libc::S_IFMT;
-    if kind != libc::S_IFREG {
-        bail!("publication destination exists but is not a regular, non-symlink file");
+        let status = command
+            .env("ROOT", root)
+            .env("KEY", key)
+            .env("FILE", &input)
+            .envs(captures.iter().map(|(name, value)| (name, value)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .with_context(|| format!("running command step {step} with sh -c"))?;
+        ensure!(status.success(), "command step {step} failed with {status}");
     }
     Ok(())
 }
@@ -241,26 +139,172 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
     use tempfile::{TempDir, tempdir};
 
-    fn fixture() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    fn fixture() -> (TempDir, PathBuf) {
         let base = tempdir().unwrap();
         let root = base.path().join("root");
-        let state = base.path().join("state");
         fs::create_dir(&root).unwrap();
-        fs::create_dir(&state).unwrap();
         let root = root.canonicalize().unwrap();
-        let state = state.canonicalize().unwrap();
         fs::write(root.join("input"), "source").unwrap();
-        (base, root, state)
+        (base, root)
     }
 
-    fn assert_clean(state: &Path) {
-        assert_eq!(fs::read_dir(state).unwrap().count(), 0);
+    fn commands(steps: &[&str]) -> Vec<String> {
+        steps.iter().map(|step| (*step).to_owned()).collect()
     }
 
     #[test]
-    fn ledger_remembers_multiple_identities_across_reopen() {
+    fn outputless_commands_receive_input_and_closed_stdin() {
+        let (_base, root) = fixture();
+        execute(
+            &root,
+            "input",
+            &commands(&[
+                "test \"$PWD\" = \"$ROOT\" && test \"$KEY\" = input && test \"$FILE\" = \"$ROOT/$KEY\" && test \"$(cat \"$FILE\")\" = source && ! read -r value",
+            ]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from("input")]
+        );
+    }
+
+    #[test]
+    fn commands_run_in_order_and_stop_at_first_failure() {
+        let (_base, root) = fixture();
+        execute(
+            &root,
+            "input",
+            &commands(&[
+                "printf first > order",
+                "test \"$(cat order)\" = first && printf second >> order",
+                "printf failed >> order; exit 7",
+                "printf unexpected >> order",
+            ]),
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(
+            fs::read_to_string(root.join("order")).unwrap(),
+            "firstsecondfailed"
+        );
+    }
+
+    #[test]
+    fn each_step_has_independent_shell_state_but_shared_files() {
+        let (_base, root) = fixture();
+        fs::create_dir(root.join("nested")).unwrap();
+        execute(
+            &root,
+            "input",
+            &commands(&[
+                "export MATCH_NAME=changed; cd nested; printf persisted > shared",
+                "test \"$PWD\" = \"$ROOT\" && test \"$MATCH_NAME\" = original && test \"$(cat nested/shared)\" = persisted",
+            ]),
+            &[("MATCH_NAME".to_owned(), "original".to_owned())],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn captures_are_data_even_with_hostile_shell_contents() {
+        let (_base, root) = fixture();
+        let hostile = "spaces ' \" $HOME $(touch injected) `touch injected` ;\n* ? [abc] \\";
+        execute(
+            &root,
+            "input",
+            &commands(&[
+                "printf '%s' \"$MATCH_NAME\" > captured; printf '%s' \"$MATCH_EMPTY\" > optional",
+            ]),
+            &[
+                ("MATCH_NAME".to_owned(), hostile.to_owned()),
+                ("MATCH_EMPTY".to_owned(), String::new()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(root.join("captured")).unwrap(), hostile);
+        assert_eq!(fs::read_to_string(root.join("optional")).unwrap(), "");
+        assert!(!root.join("injected").exists());
+    }
+
+    #[test]
+    fn inherited_output_and_capture_variables_are_removed() {
+        let (_base, root) = fixture();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "execution::tests::inherited_environment_subprocess",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FEV_EXECUTION_TEST_ROOT", &root)
+            .env("OUT", "old-output")
+            .env("OUT_TMP", "old-temporary")
+            .env("MATCH_STALE", "old-capture")
+            .env("MATCH_NAME", "old-name")
+            .env("MATCH_lowercase", "also-stale")
+            .env("FEV_PRESERVED_ENV", "keep-me")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            fs::read_to_string(root.join("environment")).unwrap(),
+            "fresh:keep-me"
+        );
+    }
+
+    #[test]
+    #[ignore = "invoked in a subprocess with an isolated inherited environment"]
+    fn inherited_environment_subprocess() {
+        let root = PathBuf::from(std::env::var_os("FEV_EXECUTION_TEST_ROOT").unwrap());
+        execute(
+            &root,
+            "input",
+            &commands(&[
+                "test \"${OUT+x}\" != x && test \"${OUT_TMP+x}\" != x && test \"${MATCH_STALE+x}\" != x && test \"${MATCH_lowercase+x}\" != x && test \"$MATCH_NAME\" = fresh && printf '%s:%s' \"$MATCH_NAME\" \"$FEV_PRESERVED_ENV\" > environment",
+            ]),
+            &[("MATCH_NAME".to_owned(), "fresh".to_owned())],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unsafe_or_nonregular_inputs_never_start_commands() {
+        let (base, root) = fixture();
+        let outside = base.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("input"), "outside").unwrap();
+        symlink(outside.join("input"), root.join("linked")).unwrap();
+        symlink(&outside, root.join("linked-parent")).unwrap();
+        fs::create_dir(root.join("directory")).unwrap();
+        for key in [
+            "linked",
+            "linked-parent/input",
+            "../outside/input",
+            "/input",
+            "input/../input",
+            "directory",
+            "missing",
+            "",
+            "input\0suffix",
+        ] {
+            assert!(
+                execute(&root, key, &commands(&["printf ran > marker"]), &[]).is_err(),
+                "{key:?}"
+            );
+            assert!(!root.join("marker").exists(), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn ledger_remembers_multiple_identities_and_separates_rules_across_reopen() {
         let state = tempdir().unwrap();
         let first = Identity {
             size: u64::MAX,
@@ -272,198 +316,163 @@ mod tests {
         };
         {
             let ledger = Ledger::open(state.path()).unwrap();
-            assert!(!ledger.succeeded("root", "input", first).unwrap());
-            ledger.record("root", "input", first, "first").unwrap();
-            ledger.record("root", "input", second, "second").unwrap();
-            ledger.record("root", "input", first, "first").unwrap();
+            assert!(
+                !ledger
+                    .succeeded("root", "input", "first-rule", first)
+                    .unwrap()
+            );
+            ledger.record("root", "input", "first-rule", first).unwrap();
+            ledger
+                .record("root", "input", "first-rule", second)
+                .unwrap();
+            ledger.record("root", "input", "first-rule", first).unwrap();
+            assert!(
+                !ledger
+                    .succeeded("root", "input", "second-rule", first)
+                    .unwrap()
+            );
+            ledger
+                .record("root", "input", "second-rule", first)
+                .unwrap();
         }
         let ledger = Ledger::open(state.path()).unwrap();
-        assert!(ledger.succeeded("root", "input", first).unwrap());
-        assert!(ledger.succeeded("root", "input", second).unwrap());
-        assert!(!ledger.succeeded("other", "input", first).unwrap());
-        assert!(!ledger.succeeded("root", "other", first).unwrap());
+        assert!(
+            ledger
+                .succeeded("root", "input", "first-rule", first)
+                .unwrap()
+        );
+        assert!(
+            ledger
+                .succeeded("root", "input", "first-rule", second)
+                .unwrap()
+        );
+        assert!(
+            ledger
+                .succeeded("root", "input", "second-rule", first)
+                .unwrap()
+        );
         assert!(
             !ledger
-                .succeeded("root", "input", Identity { size: 5, ..second })
+                .succeeded("root", "input", "second-rule", second)
                 .unwrap()
         );
-    }
-
-    #[test]
-    fn publishes_nested_output_and_replaces_only_on_success() {
-        let (_base, root, state) = fixture();
-        fs::create_dir_all(root.join("nested/deep")).unwrap();
-        let destination = root.join("nested/deep/output");
-        fs::write(&destination, "old").unwrap();
-        let old = fs::File::open(&destination).unwrap();
-        let published = execute(&root, &state,
-            "test ! -e \"$OUT_TMP\" && test \"$KEY\" = input && test \"$OUT\" = nested/deep/output && test \"$PWD\" = \"$ROOT\" && cat \"$FILE\" > \"$OUT_TMP\"",
-            "input", "nested/deep/output").unwrap();
-        assert_eq!(fs::read_to_string(&destination).unwrap(), "source");
-        use std::io::Read;
-        let mut previous = String::new();
-        (&old).read_to_string(&mut previous).unwrap();
-        assert_eq!(previous, "old");
-        assert_eq!(
-            published,
-            crate::model::identity(&root, "nested/deep/output")
-                .unwrap()
+        assert!(
+            !ledger
+                .succeeded("other", "input", "first-rule", first)
                 .unwrap()
         );
-        assert_clean(&state);
-        execute(
-            &root,
-            &state,
-            "printf fresh > \"$OUT_TMP\"",
-            "input",
-            "new/parents/output",
-        )
-        .unwrap();
-        assert_eq!(
-            fs::read_to_string(root.join("new/parents/output")).unwrap(),
-            "fresh"
+        assert!(
+            !ledger
+                .succeeded("root", "other", "first-rule", first)
+                .unwrap()
         );
-        assert_clean(&state);
-    }
-
-    #[test]
-    fn unsuccessful_or_missing_output_does_not_publish_and_cleans_temp() {
-        let (_base, root, state) = fixture();
-        fs::write(root.join("output"), "original").unwrap();
-        for command in [
-            "true",
-            "printf bad > \"$OUT_TMP\"; exit 7",
-            "mkdir \"$OUT_TMP\"",
-        ] {
-            assert!(execute(&root, &state, command, "input", "output").is_err());
-            assert_eq!(fs::read_to_string(root.join("output")).unwrap(), "original");
-            assert_clean(&state);
-        }
-    }
-
-    #[test]
-    fn input_symlinks_and_parent_escapes_never_run_command() {
-        let (base, root, state) = fixture();
-        let outside = base.path().join("outside");
-        fs::create_dir(&outside).unwrap();
-        fs::write(outside.join("input"), "outside").unwrap();
-        symlink(outside.join("input"), root.join("linked")).unwrap();
-        symlink(&outside, root.join("linked-parent")).unwrap();
-        for key in ["linked", "linked-parent/input", "../outside/input"] {
-            assert!(
-                execute(
-                    &root,
-                    &state,
-                    "printf ran > marker; printf data > \"$OUT_TMP\"",
-                    key,
-                    "output"
-                )
-                .is_err()
-            );
-            assert!(!root.join("marker").exists());
-            assert!(!root.join("output").exists());
-            assert_clean(&state);
-        }
-    }
-
-    #[test]
-    fn output_symlinks_directories_and_parent_escapes_are_refused() {
-        let (base, root, state) = fixture();
-        let outside = base.path().join("outside");
-        fs::create_dir(&outside).unwrap();
-        fs::write(outside.join("target"), "safe").unwrap();
-        symlink(outside.join("target"), root.join("linked")).unwrap();
-        symlink(&outside, root.join("linked-parent")).unwrap();
-        fs::create_dir(root.join("directory")).unwrap();
-        for out in ["linked", "linked-parent/new", "directory", "../outside/new"] {
-            assert!(
-                execute(
-                    &root,
-                    &state,
-                    "printf dangerous > \"$OUT_TMP\"",
+        assert!(
+            !ledger
+                .succeeded(
+                    "root",
                     "input",
-                    out
+                    "first-rule",
+                    Identity { size: 5, ..second }
                 )
-                .is_err()
-            );
-            assert_eq!(fs::read_to_string(outside.join("target")).unwrap(), "safe");
-            assert!(!outside.join("new").exists());
-            assert_clean(&state);
-        }
-        assert!(
-            fs::symlink_metadata(root.join("linked"))
                 .unwrap()
-                .file_type()
-                .is_symlink()
+        );
+        assert!(
+            !ledger
+                .succeeded(
+                    "root",
+                    "input",
+                    "first-rule",
+                    Identity {
+                        modified_ns: 0,
+                        ..second
+                    }
+                )
+                .unwrap()
         );
     }
 
+    fn legacy_state() -> TempDir {
+        let state = tempdir().unwrap();
+        let connection = Connection::open(state.path().join("ledger.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE successes (
+                    root_id TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    size TEXT NOT NULL,
+                    modified_ns TEXT NOT NULL,
+                    out_key TEXT NOT NULL,
+                    succeeded_ns TEXT NOT NULL,
+                    PRIMARY KEY (root_id, key, size, modified_ns)
+                ) WITHOUT ROWID;
+                INSERT INTO successes VALUES ('root', 'input', '6', '-1', 'old-output', '123');",
+            )
+            .unwrap();
+        state
+    }
+
     #[test]
-    fn temporary_symlink_and_fifo_outputs_are_refused_and_cleaned() {
-        let (_base, root, state) = fixture();
-        for command in ["ln -s \"$FILE\" \"$OUT_TMP\"", "mkfifo \"$OUT_TMP\""] {
-            assert!(execute(&root, &state, command, "input", "output").is_err());
-            assert!(!root.join("output").exists());
-            assert_clean(&state);
+    fn migration_preserves_history_without_suppressing_new_rules_and_reopens() {
+        let state = legacy_state();
+        let id = Identity {
+            size: 6,
+            modified_ns: -1,
+        };
+        {
+            let ledger = Ledger::open(state.path()).unwrap();
+            assert!(!ledger.succeeded("root", "input", "rule", id).unwrap());
+            ledger.record("root", "input", "rule", id).unwrap();
+        }
+        for _ in 0..2 {
+            let ledger = Ledger::open(state.path()).unwrap();
+            assert!(ledger.succeeded("root", "input", "rule", id).unwrap());
+            assert!(!ledger.succeeded("root", "input", "other-rule", id).unwrap());
+            let historical: (String, String, String, String, String, String) = ledger
+                .connection
+                .query_row(
+                    "SELECT root_id, key, size, modified_ns, out_key, succeeded_ns FROM legacy_successes",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                historical,
+                (
+                    "root".to_owned(),
+                    "input".to_owned(),
+                    "6".to_owned(),
+                    "-1".to_owned(),
+                    "old-output".to_owned(),
+                    "123".to_owned(),
+                )
+            );
         }
     }
 
     #[test]
-    fn root_symlink_is_refused() {
-        let (base, root, state) = fixture();
-        let alias = base.path().join("alias");
-        symlink(&root, &alias).unwrap();
-        assert!(
-            execute(
-                &alias,
-                &state,
-                "printf data > \"$OUT_TMP\"",
-                "input",
-                "output"
+    fn conflicting_archive_refuses_migration_without_destroying_data() {
+        let state = legacy_state();
+        let connection = Connection::open(state.path().join("ledger.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE legacy_successes (history TEXT NOT NULL);
+                 INSERT INTO legacy_successes VALUES ('existing-history');",
             )
-            .is_err()
+            .unwrap();
+        assert!(Ledger::open(state.path()).is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT out_key FROM successes", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "old-output"
         );
-        assert!(!root.join("output").exists());
-        assert_clean(&state);
-    }
-
-    #[test]
-    fn temporary_directory_can_live_in_root_ancestor_but_not_in_root() {
-        let (base, root, state) = fixture();
-        let command = "case \"$OUT_TMP\" in \"$ROOT\"/*) exit 3;; esac; printf safe > \"$OUT_TMP\"";
-        execute(&root, base.path(), command, "input", "output").unwrap();
-        assert_eq!(fs::read_to_string(root.join("output")).unwrap(), "safe");
-        assert_eq!(fs::read_dir(base.path()).unwrap().count(), 2);
-        assert_clean(&state);
-        assert!(execute(&root, &root, command, "input", "other").is_err());
-        assert!(!root.join("other").exists());
-    }
-}
-
-#[cfg(test)]
-mod regression_tests {
-    use super::*;
-    use std::os::unix::fs::MetadataExt;
-
-    #[test]
-    fn regression_publishes_unreadable_regular_output() {
-        let base = tempfile::tempdir().unwrap();
-        let root = base.path().join("root");
-        let state = base.path().join("state");
-        fs::create_dir(&root).unwrap();
-        fs::create_dir(&state).unwrap();
-        fs::write(root.join("input"), "source").unwrap();
-        let id = execute(
-            &root,
-            &state,
-            "printf locked > \"$OUT_TMP\"; chmod 000 \"$OUT_TMP\"",
-            "input",
-            "result",
-        )
-        .unwrap();
-        assert_eq!(id.size, 6);
-        let metadata = fs::symlink_metadata(root.join("result")).unwrap();
-        assert!(metadata.is_file());
-        assert_eq!(metadata.mode() & 0o777, 0);
+        assert_eq!(
+            connection
+                .query_row("SELECT history FROM legacy_successes", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "existing-history"
+        );
     }
 }

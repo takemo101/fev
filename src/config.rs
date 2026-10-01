@@ -1,11 +1,9 @@
-use crate::model::valid_key;
 use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -28,8 +26,8 @@ pub struct Root {
 pub struct Rule {
     pub id: String,
     pub matcher: Regex,
-    pub run: String,
-    pub out: String,
+    pub run: Vec<String>,
+    pub capture_env: Vec<(usize, String)>,
 }
 
 #[derive(Deserialize)]
@@ -59,8 +57,14 @@ struct RawRule {
     events: Vec<String>,
     #[serde(rename = "match")]
     pattern: String,
-    run: String,
-    out: String,
+    run: RawRun,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawRun {
+    Command(String),
+    Commands(Vec<String>),
 }
 
 fn default_settle() -> String {
@@ -120,6 +124,7 @@ impl Config {
             let mut rule_ids = HashSet::new();
             let mut rules = Vec::with_capacity(raw_root.rules.len());
             for raw_rule in raw_root.rules {
+                ensure!(!raw_rule.id.is_empty(), "rule id must not be empty");
                 ensure!(
                     rule_ids.insert(raw_rule.id.clone()),
                     "duplicate rule id {:?} in root {:?}",
@@ -141,16 +146,16 @@ impl Config {
         // Resolve and validate before creating any directory: an invalid state
         // location must not leave new directories inside a watched root.
         let requested_state = expand_path(&raw.state, &parent)?;
-        let (state, device) = resolve_state(&requested_state)?;
-        validate_state(&state, device, &roots)?;
+        let state = resolve_state(&requested_state)?;
+        validate_state(&state, &roots)?;
         fs::create_dir_all(&state)
             .with_context(|| format!("creating state directory {}", state.display()))?;
         let state = fs::canonicalize(&state).context("canonicalizing state directory")?;
         let metadata = fs::metadata(&state)?;
         ensure!(metadata.is_dir(), "state is not a directory");
-        // Recheck the actual created directory, including its device, rather
-        // than trusting a previously resolved nonexistent path.
-        validate_state(&state, metadata.dev(), &roots)?;
+        // Recheck the actual created directory rather than trusting a
+        // previously resolved nonexistent path.
+        validate_state(&state, &roots)?;
         Ok(Self {
             settle,
             concurrency: raw.concurrency,
@@ -177,73 +182,60 @@ impl Rule {
         // partial first alternative cannot hide a later whole-key match.
         let matcher = Regex::new(&format!(r"\A(?:{})\z", raw.pattern))
             .with_context(|| format!("rule {:?}: invalid regular expression", raw.id))?;
+        let mut capture_env = Vec::new();
+        let mut capture_keys = HashSet::new();
+        for (index, name) in matcher.capture_names().enumerate() {
+            let Some(name) = name else {
+                continue;
+            };
+            ensure!(
+                name.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+                "rule {:?}: capture name {:?} must contain only ASCII letters, digits, or underscores",
+                raw.id,
+                name
+            );
+            let key = format!("MATCH_{}", name.to_ascii_uppercase());
+            ensure!(
+                capture_keys.insert(key.clone()),
+                "rule {:?}: capture name {:?} collides after uppercasing",
+                raw.id,
+                name
+            );
+            capture_env.push((index, key));
+        }
+        let run = match raw.run {
+            RawRun::Command(command) => vec![command],
+            RawRun::Commands(commands) => commands,
+        };
         ensure!(
-            !raw.out.contains("{name}") || matcher.capture_names().any(|name| name == Some("name")),
-            "rule {:?}: out uses {{name}} without a name capture",
-            raw.id
-        );
-        let probe = raw.out.replace("{name}", "probe");
-        ensure!(
-            valid_key(&probe) && !probe.contains(".."),
-            "rule {:?}: out is not a safe relative key",
-            raw.id
-        );
-        ensure!(
-            !matcher.is_match(&probe),
-            "rule {:?}: out matches the same rule",
+            !run.is_empty() && run.iter().all(|command| !command.trim().is_empty()),
+            "rule {:?}: run must be a command or a nonempty array of nonblank commands",
             raw.id
         );
         Ok(Self {
             id: raw.id,
             matcher,
-            run: raw.run,
-            out: raw.out,
+            run,
+            capture_env,
         })
     }
-}
 
-impl Root {
-    pub fn select(&self, key: &str) -> Result<Option<(&Rule, String)>> {
-        let mut selected = None;
-        for rule in &self.rules {
-            let Some(captures) = rule.matcher.captures(key) else {
-                continue;
-            };
-            let Some(full) = captures.get(0) else {
-                continue;
-            };
-            if full.start() != 0 || full.end() != key.len() {
-                continue;
-            }
-            ensure!(
-                selected.is_none(),
-                "ambiguous rules for root {:?}, key {:?}",
-                self.id,
-                key
-            );
-            selected = Some((rule, captures));
+    pub fn environment(&self, key: &str) -> Option<Vec<(String, String)>> {
+        let captures = self.matcher.captures(key)?;
+        let full = captures.get(0)?;
+        if full.start() != 0 || full.end() != key.len() {
+            return None;
         }
-        let Some((rule, captures)) = selected else {
-            return Ok(None);
-        };
-        let out = if rule.out.contains("{name}") {
-            let name = captures.name("name").with_context(|| {
-                format!(
-                    "rule {:?}: name capture did not match key {:?}",
-                    rule.id, key
-                )
-            })?;
-            rule.out.replace("{name}", name.as_str())
-        } else {
-            rule.out.clone()
-        };
-        ensure!(
-            valid_key(&out) && !out.contains(".."),
-            "rule {:?}: rendered output {:?} is not a safe relative key",
-            rule.id,
-            out
-        );
-        Ok(Some((rule, out)))
+        Some(
+            self.capture_env
+                .iter()
+                .map(|(index, name)| {
+                    let value = captures.get(*index).map_or("", |capture| capture.as_str());
+                    (name.clone(), value.to_owned())
+                })
+                .collect(),
+        )
     }
 }
 
@@ -265,7 +257,7 @@ fn expand_path(value: &str, parent: &Path) -> Result<PathBuf> {
     })
 }
 
-fn resolve_state(path: &Path) -> Result<(PathBuf, u64)> {
+fn resolve_state(path: &Path) -> Result<PathBuf> {
     let mut resolved = PathBuf::new();
     for component in path.components() {
         match component {
@@ -298,34 +290,15 @@ fn resolve_state(path: &Path) -> Result<(PathBuf, u64)> {
             Component::Prefix(_) => bail!("unsupported state path prefix"),
         }
     }
-    let mut ancestor = resolved.as_path();
-    loop {
-        match fs::metadata(ancestor) {
-            Ok(metadata) => {
-                ensure!(metadata.is_dir(), "state ancestor is not a directory");
-                return Ok((resolved, metadata.dev()));
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                ancestor = ancestor
-                    .parent()
-                    .context("state has no existing ancestor")?;
-            }
-            Err(error) => return Err(error).context("inspecting state ancestor"),
-        }
-    }
+    Ok(resolved)
 }
 
-fn validate_state(state: &Path, device: u64, roots: &[Root]) -> Result<()> {
+fn validate_state(state: &Path, roots: &[Root]) -> Result<()> {
     for root in roots {
         ensure!(
             !state.starts_with(&root.path),
             "state {} is inside root {:?}",
             state.display(),
-            root.id
-        );
-        ensure!(
-            fs::metadata(&root.path)?.dev() == device,
-            "state and root {:?} are on different volumes",
             root.id
         );
     }
@@ -356,112 +329,181 @@ mod tests {
             Config::load(&self.config)
         }
 
-        fn rule_yaml(&self, matcher: &str, out: &str) -> String {
+        fn rule_yaml(&self, matcher: &str, run: &str) -> String {
             format!(
-                "roots:\n  - id: articles\n    path: root\n    rules:\n      - id: convert\n        events: [created]\n        match: '{matcher}'\n        run: 'cp \"$FILE\" \"$OUT_TMP\"'\n        out: '{out}'\n"
+                "roots:\n  - id: articles\n    path: root\n    rules:\n      - id: convert\n        events: [created]\n        match: '{matcher}'\n        run: {run}\n"
             )
         }
     }
 
     #[test]
-    fn selects_named_capture_and_ignores_nonmatching_input() {
+    fn captures_use_uppercase_environment_names_and_preserve_values() {
         let fixture = Fixture::new();
         let config = fixture
-            .load(&fixture.rule_yaml(r"^(?P<name>[^/.]+)\.md$", "processed/{name}.txt"))
+            .load(&fixture.rule_yaml(r"^(?P<name>.+)\.(?P<ext>[a-z]+)$", "'true'"))
             .unwrap();
-        let root = &config.roots[0];
-        let (rule, out) = root.select("weekly.md").unwrap().unwrap();
-        assert_eq!(rule.id, "convert");
-        assert_eq!(out, "processed/weekly.txt");
-        assert!(root.select("weekly.txt").unwrap().is_none());
+        let rule = &config.roots[0].rules[0];
+        assert_eq!(
+            rule.environment("MiXeD $(touch pwned);../x.md").unwrap(),
+            vec![
+                (
+                    "MATCH_NAME".to_owned(),
+                    "MiXeD $(touch pwned);../x".to_owned()
+                ),
+                ("MATCH_EXT".to_owned(), "md".to_owned()),
+            ]
+        );
+        assert!(rule.environment("weekly").is_none());
+    }
+
+    #[test]
+    fn unnamed_groups_do_not_shift_named_capture_values() {
+        let fixture = Fixture::new();
+        let config = fixture
+            .load(&fixture.rule_yaml(r"^(prefix)(?P<name>[^.]+)\.in$", "'true'"))
+            .unwrap();
+        assert_eq!(
+            config.roots[0].rules[0]
+                .environment("prefixvalue.in")
+                .unwrap(),
+            vec![("MATCH_NAME".to_owned(), "value".to_owned())]
+        );
     }
 
     #[test]
     fn alternation_cannot_escape_whole_key_matching() {
         let fixture = Fixture::new();
         let config = fixture
-            .load(&fixture.rule_yaml("^in|input$", "finished"))
+            .load(&fixture.rule_yaml("^in|input$", "'true'"))
             .unwrap();
-        let root = &config.roots[0];
-        assert!(root.select("input").unwrap().is_some());
-        assert!(root.select("in-more").unwrap().is_none());
-        assert!(root.select("some-input").unwrap().is_none());
+        let rule = &config.roots[0].rules[0];
+        assert_eq!(rule.environment("input"), Some(Vec::new()));
+        assert!(rule.environment("in-more").is_none());
+        assert!(rule.environment("some-input").is_none());
+        assert!(rule.environment("input\n").is_none());
     }
 
     #[test]
-    fn self_match_probe_uses_entire_match_not_partial_alternative() {
-        let fixture = Fixture::new();
-        let config = fixture
-            .load(&fixture.rule_yaml("^in|other$", "in-more"))
-            .unwrap();
-        assert_eq!(config.roots[0].select("in").unwrap().unwrap().1, "in-more");
-        assert!(config.roots[0].select("in-more").unwrap().is_none());
+    fn environment_rejects_partial_matches_even_with_an_unanchored_matcher() {
+        let rule = Rule {
+            id: "unanchored".to_owned(),
+            matcher: Regex::new("input").unwrap(),
+            run: vec!["true".to_owned()],
+            capture_env: Vec::new(),
+        };
+        assert_eq!(rule.environment("input"), Some(Vec::new()));
+        assert!(rule.environment("input-more").is_none());
+        assert!(rule.environment("some-input").is_none());
     }
 
     #[test]
-    fn overlapping_rules_are_ambiguous_instead_of_ordered() {
+    fn overlapping_rules_match_independently() {
         let fixture = Fixture::new();
-        let mut yaml = fixture.rule_yaml("^input$", "first");
-        yaml.push_str("      - id: another\n        events: [created]\n        match: '^input$'\n        run: 'true'\n        out: second\n");
+        let mut yaml = fixture.rule_yaml("^(?P<name>input)$", "'true'");
+        yaml.push_str("      - id: another\n        events: [created]\n        match: '^(?P<value>input)$'\n        run: 'true'\n");
         let config = fixture.load(&yaml).unwrap();
-        let error = config.roots[0].select("input").unwrap_err();
-        assert!(error.to_string().contains("ambiguous"));
-    }
-
-    #[test]
-    fn rendered_capture_must_still_be_a_safe_key() {
-        let fixture = Fixture::new();
-        let config = fixture
-            .load(&fixture.rule_yaml(r"^prefix(?P<name>.*)\.in$", "{name}"))
-            .unwrap();
-        let root = &config.roots[0];
-        for key in [
-            "prefix../escape.in",
-            "prefix/absolute.in",
-            "prefix.in",
-            "prefix./dot.in",
-        ] {
-            assert!(
-                root.select(key).is_err(),
-                "accepted unsafe output for {key}"
-            );
-        }
-        assert_eq!(root.select("prefixsafe.in").unwrap().unwrap().1, "safe");
-    }
-
-    #[test]
-    fn unmatched_required_output_capture_is_rejected() {
-        let fixture = Fixture::new();
-        let config = fixture
-            .load(&fixture.rule_yaml(r"^(?P<name>x)?input$", "{name}.done"))
-            .unwrap();
-        assert!(config.roots[0].select("input").is_err());
+        let rules = &config.roots[0].rules;
         assert_eq!(
-            config.roots[0].select("xinput").unwrap().unwrap().1,
-            "x.done"
+            rules[0].environment("input"),
+            Some(vec![("MATCH_NAME".to_owned(), "input".to_owned())])
+        );
+        assert_eq!(
+            rules[1].environment("input"),
+            Some(vec![("MATCH_VALUE".to_owned(), "input".to_owned())])
         );
     }
 
     #[test]
-    fn rejects_rule_validation_boundaries_before_creating_state() {
-        let invalid = [
-            ("^input$", ""),
-            ("^input$", "/outside"),
-            ("^input$", "nested/../outside"),
-            ("^input$", "a..b"),
-            ("^input$", "./output"),
-            ("^input$", "{name}.done"),
-            ("input$", "output"),
-            ("^input", "output"),
-            ("^[$", "output"),
-            ("^input$", "input"),
-            ("^(?P<name>[^/.]+)\\.md$", "{name}.md"),
-        ];
-        for (matcher, out) in invalid {
+    fn optional_capture_exports_empty_string_when_unmatched() {
+        let fixture = Fixture::new();
+        let config = fixture
+            .load(&fixture.rule_yaml(r"^(?P<name>x)?input$", "'true'"))
+            .unwrap();
+        let rule = &config.roots[0].rules[0];
+        assert_eq!(
+            rule.environment("input"),
+            Some(vec![("MATCH_NAME".to_owned(), String::new())])
+        );
+        assert_eq!(
+            rule.environment("xinput"),
+            Some(vec![("MATCH_NAME".to_owned(), "x".to_owned())])
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_capture_names_and_uppercase_collisions() {
+        for matcher in [
+            "^(?P<name>x)(?P<NAME>y)$",
+            "^(?P<naïve>x)$",
+            "^(?P<with.dot>x)$",
+            "^(?P<with[bracket>x)$",
+        ] {
+            let fixture = Fixture::new();
+            let error = fixture
+                .load(&fixture.rule_yaml(matcher, "'true'"))
+                .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("capture"), "{message}");
+            assert!(!fixture.dir.path().join("state").exists());
+        }
+    }
+
+    #[test]
+    fn ascii_capture_names_allow_underscores_and_digits() {
+        let fixture = Fixture::new();
+        let config = fixture
+            .load(&fixture.rule_yaml("^(?P<_name2>input)$", "'true'"))
+            .unwrap();
+        assert_eq!(
+            config.roots[0].rules[0].environment("input"),
+            Some(vec![("MATCH__NAME2".to_owned(), "input".to_owned())])
+        );
+    }
+
+    #[test]
+    fn run_accepts_a_string_or_an_ordered_command_array() {
+        let fixture = Fixture::new();
+        let single = fixture
+            .load(&fixture.rule_yaml("^input$", "'printf first'"))
+            .unwrap();
+        assert_eq!(single.roots[0].rules[0].run, vec!["printf first"]);
+        let array = fixture
+            .load(&fixture.rule_yaml("^input$", "['printf first', 'printf second']"))
+            .unwrap();
+        assert_eq!(
+            array.roots[0].rules[0].run,
+            vec!["printf first", "printf second"]
+        );
+    }
+
+    #[test]
+    fn rejects_empty_or_invalid_run_before_creating_state() {
+        for run in [
+            "''",
+            "'   '",
+            "[]",
+            "['true', '']",
+            "['true', '   ']",
+            "null",
+            "42",
+            "{}",
+        ] {
             let fixture = Fixture::new();
             assert!(
-                fixture.load(&fixture.rule_yaml(matcher, out)).is_err(),
-                "accepted {matcher} / {out}"
+                fixture.load(&fixture.rule_yaml("^input$", run)).is_err(),
+                "accepted run: {run}"
+            );
+            assert!(!fixture.dir.path().join("state").exists());
+        }
+    }
+
+    #[test]
+    fn rejects_rule_validation_boundaries_before_creating_state() {
+        for matcher in ["input$", "^input", "^[$"] {
+            let fixture = Fixture::new();
+            assert!(
+                fixture.load(&fixture.rule_yaml(matcher, "'true'")).is_err(),
+                "accepted {matcher}"
             );
             assert!(!fixture.dir.path().join("state").exists());
         }
@@ -473,19 +515,24 @@ mod tests {
             ("events: [created]", "events: []"),
             ("events: [created]", "events: [created, deleted]"),
             ("id: articles", "id: ''"),
+            ("id: convert", "id: ''"),
             ("roots:", "concurrency: 0\nroots:"),
             ("roots:", "concurrency: -1\nroots:"),
             ("roots:", "settle: nonsense\nroots:"),
             ("roots:", "typo: value\nroots:"),
             ("    path: root", "    path: root\n    typo: value"),
             (
-                "        out: 'finished'",
-                "        out: 'finished'\n        typo: value",
+                "        run: 'true'",
+                "        run: 'true'\n        typo: value",
+            ),
+            (
+                "        run: 'true'",
+                "        run: 'true'\n        out: finished",
             ),
         ];
         for (from, to) in cases {
             let fixture = Fixture::new();
-            let yaml = fixture.rule_yaml("^input$", "finished").replace(from, to);
+            let yaml = fixture.rule_yaml("^input$", "'true'").replace(from, to);
             assert!(fixture.load(&yaml).is_err(), "accepted replacement {to}");
         }
     }
@@ -494,11 +541,11 @@ mod tests {
     fn rejects_duplicate_root_and_rule_ids() {
         let fixture = Fixture::new();
         fs::create_dir(fixture.dir.path().join("second")).unwrap();
-        let mut yaml = fixture.rule_yaml("^input$", "finished");
+        let mut yaml = fixture.rule_yaml("^input$", "'true'");
         yaml.push_str("  - id: articles\n    path: second\n    rules: []\n");
         assert!(fixture.load(&yaml).is_err());
-        let mut yaml = fixture.rule_yaml("^input$", "finished");
-        yaml.push_str("      - id: convert\n        events: [created]\n        match: '^different$'\n        run: 'true'\n        out: other\n");
+        let mut yaml = fixture.rule_yaml("^input$", "'true'");
+        yaml.push_str("      - id: convert\n        events: [created]\n        match: '^different$'\n        run: 'true'\n");
         assert!(fixture.load(&yaml).is_err());
     }
 
@@ -508,14 +555,14 @@ mod tests {
             let fixture = Fixture::new();
             fs::write(fixture.dir.path().join("file"), "not a directory").unwrap();
             let yaml = fixture
-                .rule_yaml("^input$", "finished")
+                .rule_yaml("^input$", "'true'")
                 .replace("path: root", &format!("path: {path}"));
             assert!(fixture.load(&yaml).is_err());
         }
         for path in ["root", "root/child"] {
             let fixture = Fixture::new();
             fs::create_dir(fixture.dir.path().join("root/child")).unwrap();
-            let mut yaml = fixture.rule_yaml("^input$", "finished");
+            let mut yaml = fixture.rule_yaml("^input$", "'true'");
             yaml.push_str(&format!(
                 "  - id: second\n    path: {path}\n    rules: []\n"
             ));
@@ -527,10 +574,7 @@ mod tests {
     fn state_in_root_is_rejected_without_creating_any_component() {
         for state in ["root", "root/new/state", "root/new/../state"] {
             let fixture = Fixture::new();
-            let yaml = format!(
-                "state: {state}\n{}",
-                fixture.rule_yaml("^input$", "finished")
-            );
+            let yaml = format!("state: {state}\n{}", fixture.rule_yaml("^input$", "'true'"));
             assert!(fixture.load(&yaml).is_err());
             assert!(!fixture.dir.path().join("root/new").exists());
             assert!(!fixture.dir.path().join("root/state").exists());
@@ -542,7 +586,7 @@ mod tests {
         let fixture = Fixture::new();
         let yaml = format!(
             "state: root/../new/../safe/state\n{}",
-            fixture.rule_yaml("^input$", "finished")
+            fixture.rule_yaml("^input$", "'true'")
         );
         let config = fixture.load(&yaml).unwrap();
         assert_eq!(
@@ -556,7 +600,7 @@ mod tests {
     #[test]
     fn state_ancestor_of_root_is_allowed() {
         let fixture = Fixture::new();
-        let yaml = format!("state: .\n{}", fixture.rule_yaml("^input$", "finished"));
+        let yaml = format!("state: .\n{}", fixture.rule_yaml("^input$", "'true'"));
         let config = fixture.load(&yaml).unwrap();
         assert_eq!(config.state, fs::canonicalize(fixture.dir.path()).unwrap());
     }
@@ -567,7 +611,7 @@ mod tests {
         fs::write(fixture.dir.path().join("state"), "not a directory").unwrap();
         assert!(
             fixture
-                .load(&fixture.rule_yaml("^input$", "finished"))
+                .load(&fixture.rule_yaml("^input$", "'true'"))
                 .is_err()
         );
     }
@@ -584,37 +628,12 @@ mod tests {
         .unwrap();
         let yaml = format!(
             "state: alias/new/state\n{}",
-            fixture.rule_yaml("^input$", "finished")
+            fixture.rule_yaml("^input$", "'true'")
         );
         assert!(fixture.load(&yaml).is_err());
         assert!(!fixture.dir.path().join("root/new").exists());
-        let mut yaml = fixture.rule_yaml("^input$", "finished");
+        let mut yaml = fixture.rule_yaml("^input$", "'true'");
         yaml.push_str("  - id: second\n    path: alias\n    rules: []\n");
         assert!(fixture.load(&yaml).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn different_volume_is_rejected_before_state_creation_when_available() {
-        use std::os::unix::fs::MetadataExt;
-        let fixture = Fixture::new();
-        let root_device = fs::metadata(fixture.dir.path()).unwrap().dev();
-        let other = ["/dev/shm", "/dev", "/Volumes"]
-            .into_iter()
-            .map(Path::new)
-            .find(|path| {
-                fs::metadata(path)
-                    .is_ok_and(|metadata| metadata.is_dir() && metadata.dev() != root_device)
-            });
-        let Some(other) = other else { return };
-        let state = other.join(fixture.dir.path().file_name().unwrap());
-        let yaml = format!(
-            "state: '{}'\n{}",
-            state.display(),
-            fixture.rule_yaml("^input$", "finished")
-        );
-        let error = fixture.load(&yaml).unwrap_err();
-        assert!(error.to_string().contains("volume"), "{error:#}");
-        assert!(!state.exists());
     }
 }

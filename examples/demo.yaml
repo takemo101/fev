@@ -12,16 +12,22 @@ roots:
       - id: uppercase
         events: [created]
         match: '^(?P<name>[^/.]+)\.txt$'
-        run: tr '[:lower:]' '[:upper:]' < "$FILE" > "$OUT_TMP"
-        out: "{name}.upper.txt"
+        run: tr '[:lower:]' '[:upper:]' < "$FILE" > "${MATCH_NAME}.upper.txt"
 
       # hello.upper.txt -> hello.done.txt
       - id: finish
         events: [created]
         match: '^(?P<name>[^/.]+)\.upper\.txt$'
-        run: |
-          {
-            printf 'Processed: %s\n' "$KEY"
-            cat "$FILE"
-          } > "$OUT_TMP"
-        out: "{name}.done.txt"
+        run:
+          - |
+            {
+              printf 'Processed: %s\n' "$KEY"
+              cat "$FILE"
+            } > "${MATCH_NAME}.done.txt"
+          - 'printf "Finished: %s\n" "${MATCH_NAME}.done.txt"'
+
+      # Also matches hello.txt; runs independently with no output file.
+      - id: observe
+        events: [created]
+        match: '^(?P<name>[^/.]+)\.txt$'
+        run: 'printf "Observed: %s\n" "$KEY"'
