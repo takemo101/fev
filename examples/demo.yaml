@@ -1,5 +1,6 @@
 # Paths resolve relative to this YAML file.
 # Start with `just demo`, then run `just demo-input` in another terminal.
+# Opt into initial processing for existing demo inputs and demo-test's startup seed.
 settle: 200ms
 concurrency: 2
 state: ./demo/state
@@ -10,13 +11,13 @@ roots:
     rules:
       # hello.txt -> hello.upper.txt
       - id: uppercase
-        events: [created]
+        events: [startup, created, updated]
         match: '^(?P<name>[^/.]+)\.txt$'
         run: tr '[:lower:]' '[:upper:]' < "$FILE" > "${MATCH_NAME}.upper.txt"
 
       # hello.upper.txt -> hello.done.txt
       - id: finish
-        events: [created]
+        events: [startup, created, updated]
         match: '^(?P<name>[^/.]+)\.upper\.txt$'
         run:
           - |
@@ -28,6 +29,6 @@ roots:
 
       # Also matches hello.txt; runs independently with no output file.
       - id: observe
-        events: [created]
+        events: [startup, created, updated]
         match: '^(?P<name>[^/.]+)\.txt$'
         run: 'printf "Observed: %s\n" "$KEY"'

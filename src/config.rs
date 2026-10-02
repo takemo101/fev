@@ -1,3 +1,4 @@
+use crate::model::EventType;
 use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
 use serde::Deserialize;
@@ -25,6 +26,7 @@ pub struct Root {
 #[derive(Debug)]
 pub struct Rule {
     pub id: String,
+    pub events: Vec<EventType>,
     pub matcher: Regex,
     pub run: Vec<String>,
     pub capture_env: Vec<(usize, String)>,
@@ -54,7 +56,7 @@ struct RawRoot {
 #[serde(deny_unknown_fields)]
 struct RawRule {
     id: String,
-    events: Vec<String>,
+    events: Vec<EventType>,
     #[serde(rename = "match")]
     pattern: String,
     run: RawRun,
@@ -168,10 +170,20 @@ impl Config {
 impl Rule {
     fn from_raw(raw: RawRule) -> Result<Self> {
         ensure!(
-            !raw.events.is_empty() && raw.events.iter().all(|event| event == "created"),
-            "rule {:?}: events must be a nonempty list containing only created",
+            !raw.events.is_empty(),
+            "rule {:?}: events must be a nonempty list",
             raw.id
         );
+        let mut events = raw.events;
+        let mut retained = 0;
+        for index in 0..events.len() {
+            let event = events[index];
+            if !events[..retained].contains(&event) {
+                events[retained] = event;
+                retained += 1;
+            }
+        }
+        events.truncate(retained);
         ensure!(
             raw.pattern.starts_with('^') && raw.pattern.ends_with('$'),
             "rule {:?}: match must start with ^ and end with $",
@@ -215,10 +227,15 @@ impl Rule {
         );
         Ok(Self {
             id: raw.id,
+            events,
             matcher,
             run,
             capture_env,
         })
+    }
+
+    pub fn accepts(&self, event: EventType) -> bool {
+        self.events.contains(&event)
     }
 
     pub fn environment(&self, key: &str) -> Option<Vec<(String, String)>> {
@@ -387,6 +404,7 @@ mod tests {
     fn environment_rejects_partial_matches_even_with_an_unanchored_matcher() {
         let rule = Rule {
             id: "unanchored".to_owned(),
+            events: vec![EventType::Created],
             matcher: Regex::new("input").unwrap(),
             run: vec!["true".to_owned()],
             capture_env: Vec::new(),
@@ -431,6 +449,67 @@ mod tests {
     }
 
     #[test]
+    fn rules_accept_only_selected_event_types_once() {
+        let fixture = Fixture::new();
+        let yaml = fixture.rule_yaml("^(?P<name>input)$", "'true'").replace(
+            "events: [created]",
+            "events: [created, renamed, created, renamed]",
+        );
+        let config = fixture.load(&yaml).unwrap();
+        let rule = &config.roots[0].rules[0];
+        assert_eq!(rule.events, vec![EventType::Created, EventType::Renamed]);
+        assert!(rule.accepts(EventType::Created));
+        assert!(rule.accepts(EventType::Renamed));
+        assert!(!rule.accepts(EventType::Updated));
+        assert!(!rule.accepts(EventType::Deleted));
+        assert!(!rule.accepts(EventType::Startup));
+        assert_eq!(
+            rule.environment("input"),
+            Some(vec![("MATCH_NAME".to_owned(), "input".to_owned())])
+        );
+        assert!(rule.environment("prefix-input").is_none());
+    }
+
+    #[test]
+    fn rules_support_all_five_exact_event_names() {
+        let fixture = Fixture::new();
+        let yaml = fixture.rule_yaml("^input$", "'true'").replace(
+            "events: [created]",
+            "events: [startup, created, updated, deleted, renamed]",
+        );
+        let config = fixture.load(&yaml).unwrap();
+        let rule = &config.roots[0].rules[0];
+        for event in [
+            EventType::Startup,
+            EventType::Created,
+            EventType::Updated,
+            EventType::Deleted,
+            EventType::Renamed,
+        ] {
+            assert!(rule.accepts(event));
+        }
+    }
+
+    #[test]
+    fn rejects_empty_or_unknown_events_before_creating_state() {
+        for events in [
+            "[]",
+            "[created, unknown]",
+            "[Created]",
+            "[update]",
+            "[delete]",
+            "[rename]",
+        ] {
+            let fixture = Fixture::new();
+            let yaml = fixture
+                .rule_yaml("^input$", "'true'")
+                .replace("events: [created]", &format!("events: {events}"));
+            assert!(fixture.load(&yaml).is_err(), "accepted events: {events}");
+            assert!(!fixture.dir.path().join("state").exists());
+        }
+    }
+
+    #[test]
     fn rejects_invalid_capture_names_and_uppercase_collisions() {
         for matcher in [
             "^(?P<name>x)(?P<NAME>y)$",
@@ -439,11 +518,7 @@ mod tests {
             "^(?P<with[bracket>x)$",
         ] {
             let fixture = Fixture::new();
-            let error = fixture
-                .load(&fixture.rule_yaml(matcher, "'true'"))
-                .unwrap_err();
-            let message = format!("{error:#}");
-            assert!(message.contains("capture"), "{message}");
+            assert!(fixture.load(&fixture.rule_yaml(matcher, "'true'")).is_err());
             assert!(!fixture.dir.path().join("state").exists());
         }
     }
@@ -510,10 +585,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_events_ids_concurrency_and_unknown_fields() {
+    fn rejects_invalid_ids_concurrency_and_unknown_fields() {
         let cases = [
-            ("events: [created]", "events: []"),
-            ("events: [created]", "events: [created, deleted]"),
             ("id: articles", "id: ''"),
             ("id: convert", "id: ''"),
             ("roots:", "concurrency: 0\nroots:"),

@@ -1,5 +1,7 @@
 # Paths are relative to this YAML file, not the launching terminal.
 # Create ./work before starting fev; ./state is created automatically.
+# Live-only rules: existing inputs do not run on initial scan, even without state.
+# Add startup to a rule's events to opt into initial processing.
 settle: 200ms
 concurrency: 2
 state: ./state
@@ -10,7 +12,7 @@ roots:
     rules:
       # Weekly Report.txt -> Weekly Report.upper.txt; exclude generated files.
       - id: uppercase
-        events: [created]
+        events: [created, updated]
         match: '^(?P<name>[^/.]+)\.txt$'
         run:
           - |
@@ -19,12 +21,12 @@ roots:
 
       # The new file reaches this rule through OS notifications and settle.
       - id: finish
-        events: [created]
+        events: [created, updated]
         match: '^(?P<name>[^/.]+)\.upper\.txt$'
         run: 'cat "$FILE" > "${MATCH_NAME}.done.txt"'
 
       # Also matches the original input; independent and outputless.
       - id: observe
-        events: [created]
+        events: [created, updated]
         match: '^(?P<name>[^/.]+)\.txt$'
         run: 'printf "Observed: %s\n" "$KEY"'
