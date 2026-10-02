@@ -14,6 +14,7 @@ Read the bundled [configuration reference](references/configuration.md) before a
 Use the request and existing configuration to determine:
 
 - Input directories, filename patterns, and subdirectory coverage.
+- Event types: opt-in startup inventory, live creation, updates, deletion, or same-root rename; rename patterns match the new path.
 - Commands, arguments, and installed external tools.
 - Whether outputs are needed, their names, and downstream processing.
 - Independent jobs versus commands that must execute in order.
@@ -42,7 +43,7 @@ cat "$HOME/fev-example/work/Weekly Report.done.txt"
 
 Both contain `HELLO FEV`. The original remains. Logs include `Observed: Weekly Report.txt` and `Uppercased: Weekly Report.txt`; their order is unspecified. If inspection is too early, wait and repeat it.
 
-Change the input to trigger processing again. Stop with `Ctrl-C`; active commands drain before exit. This workspace retains state, so unchanged successful inputs are skipped on later runs.
+Change the input to trigger processing again. Stop with `Ctrl-C`; active commands drain before exit. The template uses live-only `[created, updated]`, so initial files do not run even with fresh or missing state. Retained state also suppresses unchanged successful material identities.
 
 If fev is not installed, obtain its executable first. From a source checkout, Rust/Cargo and a C compiler are required: run `cargo build --release` in that checkout, then use the resulting executable's **absolute path** instead of `fev` when following this guide.
 
@@ -50,7 +51,7 @@ If fev is not installed, obtain its executable first. From a source checkout, Ru
 
 1. Resolve `path` and `state` relative to the YAML, not the launching terminal. Create roots first; keep state outside every root.
 2. Assign nonempty, unique root ids and per-root rule ids.
-3. Use `events: [created]` for creation **and updates**. Match the entire root-relative key using anchored regex, not glob syntax.
+3. Use `events: [created, updated]` for live creation **and updates**, without initial processing. The five exact types are `startup`, `created`, `updated`, `deleted`, and `renamed`. Opt in with `[startup]` for initial-only work or `[startup, created, updated]` for initial and live work; no alias or automatic event-list change preserves the old initial behavior. Match the entire root-relative key using anchored regex, not glob syntax; rename matching and captures use the new key.
 4. Access `(?P<name>...)` as `"${MATCH_NAME}"`. Only the variable name is uppercased; values retain spaces and case. There is no `{{ name }}` substitution.
 5. Quote `"$FILE"` and output paths. Commands run inside the root. Use one `run` array for ordered commands; separate rules have no ordering guarantee, even with `concurrency: 1`.
 6. Exclude generated files from input patterns, avoid competing writes, and leave final outputs unmatched.
@@ -59,11 +60,13 @@ The template's `[^/.]+` excludes dotted basenames and subdirectories, preventing
 
 Each array item is a separate `sh -c`; `cd`, variables, and `export` do not carry over. Use one `|` block when shell state must be shared, with appropriate failure handling.
 
+Use `"$EVENT"` to distinguish events, including `EVENT=startup`. `OLD_KEY` and `OLD_FILE` contain the previous path only for `renamed` and are explicitly empty otherwise, including startup. Deletion/rename paths can be absent or reused by command start; use them for metadata actions, not guaranteed file reads. Only the initial root scan produces `startup`; its internal inventory is maintained even when no rules accept startup, so existing-file updates, deletion, and rename still work. Startup has no offline deletion/rename history. See the bundled reference for initial-settle coalescence, directory expansion, correlation limits, and shared durable deduplication.
+
 ## 4. Verify safely and deliver
 
-There is **no `--check` or dry-run**. Startup processes existing inputs. Use trusted commands, isolated roots/state, and test services where needed.
+There is **no `--check` or dry-run**. Only matching startup rules process existing inputs from the initial scan; once running, native events can still trigger live rules. Use trusted commands, isolated roots/state, and test services where needed.
 
-Verify initial processing, updates, loop avoidance, expected outputs or external effects, and restart skipping. Restart after YAML changes; configuration is not hot-reloaded.
+Verify the chosen initial-processing behavior, live creation/updates, loop avoidance, expected outputs or external effects, and restart skipping. Startup shares `event_id = 0` material deduplication with created/updated, including successes recorded before the split, without a new ledger migration. Retained successes suppress unchanged inputs; opting out of startup also prevents initial work without a ledger. Deleting/changing state or root/rule ids, or crashes before success recording, can otherwise permit re-execution with startup enabled. Failed initial work retries on restart only if that rule accepts startup. If transition rules are requested, also verify deletion and same-root rename, including matching the new key. Restart after YAML changes; configuration is not hot-reloaded.
 
 Deliver the complete YAML, destination, tool prerequisites, setup/start/input/inspection/stop commands, existing-input impact, and exercised verification. Do not claim untested external operations succeeded.
 
@@ -72,7 +75,7 @@ Deliver the complete YAML, destination, tool prerequisites, setup/start/input/in
 | Symptom | Fix |
 | --- | --- |
 | Missing root | Create it at the YAML-relative path |
-| Unknown fields/events | Use `state`, `settle`, and `created`; not `state_dir`, `debounce`, `out`, or `updated` |
+| Unknown fields/events | Use `state`, `settle`, and the five documented event names; not `state_dir`, `debounce`, or `out` |
 | YAML parse error | Use spaces, single-quoted regex, and `|` for complex commands |
 | Nothing runs | Check full-key matching, regular-file eligibility, and success records |
 | Missing capture | Use uppercase `MATCH_NAME`; unmatched optional groups are empty |

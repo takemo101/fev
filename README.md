@@ -14,7 +14,7 @@ The authoring skill includes its own specification and template, so it can be us
 
 ## Purpose
 
-- React to file creation and updates using native OS notifications rather than repeated directory polling.
+- React to file creation, updates, deletion, and same-root renames using native OS notifications rather than repeated directory polling.
 - Run every matching rule independently, with a shared concurrency limit.
 - Combine sequential commands and file-triggered stages without requiring an output file from every job.
 - Keep a durable, per-rule success ledger so unchanged successful inputs are skipped after restart.
@@ -128,7 +128,7 @@ fev --version
 
 `fev` runs in the foreground. Stop with `Ctrl-C` or SIGTERM; it stops starting new work and waits for active command sequences to finish. Runtime logs go to stderr, and command stdout/stderr are inherited.
 
-There is **no `--check` or dry-run option**. Starting the runner scans existing inputs and may execute commands immediately after settling. Use trusted commands and isolated test directories when trying a new configuration.
+There is **no `--check` or dry-run option**. Starting the runner scans existing inputs, but only matching rules subscribed to `startup` may execute for that initial scan after settling. Once running, native events can trigger the normal live rules. Use trusted commands and isolated test directories when trying a new configuration.
 
 ## Quick start
 
@@ -176,7 +176,7 @@ The original and intermediate files remain in `work`. Update the input to proces
 printf 'updated input\n' > "$HOME/fev-example/work/Weekly Report.txt"
 ```
 
-After processing, the final file contains `UPDATED INPUT`. If inspection is too early, wait and repeat it. The state directory is `$HOME/fev-example/state`; keeping it makes later starts skip unchanged successful inputs. Stop the runner with `Ctrl-C` before editing and restarting the configuration.
+After processing, the final file contains `UPDATED INPUT`. If inspection is too early, wait and repeat it. The starter uses `[created, updated]`: existing files do not run on initial scan, even with fresh or missing state. The state directory is `$HOME/fev-example/state`; keeping it also suppresses unchanged successful material identities. Stop the runner with `Ctrl-C` before editing and restarting the configuration.
 
 ### Repository demo
 
@@ -200,7 +200,7 @@ Processed: hello.upper.txt
 HELLO FEV
 ```
 
-For an automated, isolated demo that checks startup processing, live updates, and shutdown:
+The demo explicitly uses `[startup, created, updated]` to process existing inputs too. For an automated, isolated demo that checks this opt-in startup processing, live updates, and shutdown:
 
 ```sh
 just demo-test
@@ -222,7 +222,7 @@ roots:
     path: ./work
     rules:
       - id: uppercase
-        events: [created]
+        events: [created, updated]
         match: '^(?P<name>[^/.]+)\.txt$'
         run:
           - |
@@ -230,12 +230,12 @@ roots:
           - 'printf "Uppercased: %s\n" "$KEY"'
 
       - id: finish
-        events: [created]
+        events: [created, updated]
         match: '^(?P<name>[^/.]+)\.upper\.txt$'
         run: 'cat "$FILE" > "${MATCH_NAME}.done.txt"'
 
       - id: observe
-        events: [created]
+        events: [created, updated]
         match: '^(?P<name>[^/.]+)\.txt$'
         run: 'printf "Observed: %s\n" "$KEY"'
 ```
@@ -251,30 +251,40 @@ roots:
 | `roots[].path` | Existing directory to watch recursively |
 | `roots[].rules` | Rules applied only to that root |
 | `rules[].id` | Nonempty rule identifier, unique within its root |
-| `rules[].events` | Nonempty event list; only `created` is supported |
+| `rules[].events` | Nonempty list of `startup`, `created`, `updated`, `deleted`, or `renamed`; repeated names do not repeat execution |
 | `rules[].match` | Full-key regex beginning with `^` and ending with `$` |
 | `rules[].run` | Command string or nonempty array of nonblank command strings |
 
 Only `settle`, `concurrency`, and `state` are optional. Relative root/state paths resolve against **the YAML file's directory**, not the launching terminal's working directory. `~` expands to HOME; `$HOME` inside a YAML path does not expand. Roots cannot overlap, and state cannot be inside any root. State is created automatically if missing.
 
-`created` includes both new files and updates. The runner processes regular files, not directory entries or input paths containing symlinks. Existing inputs are scanned once at startup.
+`startup` means an existing regular file found by the initial root scan, and is opt-in per rule. `created` means a newly appearing file after that scan; `updated` means a change at an existing key. Use `[created, updated]` for live-only processing, `[startup]` for initial processing only, or `[startup, created, updated]` to include both. There is no default event-list change or compatibility alias: add the exact name `startup` explicitly to retain initial processing.
+
+The initial scan always builds the internal inventory for update, deletion, and rename classification, even without any startup subscription. Existing-file updates work once ready, including while initial settling is pending. Startup/created/updated content events settle and coalesce; `settle` is not a writer-completion guarantee. If an initial file updates during settling, startup-only and updated-only rules remain independently eligible; a rule accepting both coalesces the latest material into one `updated` run. Only the initial root scan generates `startup`; introduced or moved-in directory scans produce `created`/`updated`, while correlated same-root moves remain `renamed`. Startup does not replay deletions or renames that happened while fev was stopped.
+
+`deleted` means a disappearance, queued after a rename-correlation grace of at least `100ms` or `settle`, whichever is longer. `renamed` means a correlated move within one root, queued immediately once the old/new pair is known, without settling. Directory operations expand into events for regular-file descendants, not directory entries. Symlink paths are excluded.
+
+Native notifications are not a complete operation history. On macOS, single-path FSEvents rename notifications are correlated using the root's inventory and device/inode identity; a missing or ambiguous pair cannot guarantee `renamed`. Uncorrelated moves become deletion and creation/update events. Moves across watched roots are `deleted` in the source and `created`/`updated` in the destination, not `renamed`. Newly introduced or renamed directory subtrees are scanned without periodic full-root polling.
 
 ### Matching and environment
 
-A key is the root-relative file path, such as `reports/Weekly.txt`. `match` uses Rust regular expressions, not shell globs; it must match the entire key. Lookaround and backreferences are unsupported.
+A key is the root-relative file path, such as `reports/Weekly.txt`. A rule must accept the event type and match the entire key. For `renamed`, matching and captures use the **new** key, never the old one. `match` uses Rust regular expressions, not shell globs; lookaround and backreferences are unsupported.
 
 The example's `[^/.]+` accepts spaces and mixed case, but excludes dots and subdirectories. This is an example naming convention that keeps `.upper.txt` and `.done.txt` out of the original-input rule, not a restriction on all fev inputs.
 
 | Variable | Value |
 | --- | --- |
 | `ROOT` | Absolute watched-root path |
-| `KEY` | Root-relative input path |
-| `FILE` | Absolute input-file path |
+| `EVENT` | `startup`, `created`, `updated`, `deleted`, or `renamed` |
+| `KEY` | Current key for content events; vanished key for deletion; new key for rename |
+| `FILE` | Absolute path corresponding to `KEY` |
+| `OLD_KEY` / `OLD_FILE` | Previous relative/absolute path for rename; explicitly empty for every other event |
 | `MATCH_<NAME>` | Named regex capture value |
 
 `(?P<name>...)` becomes `MATCH_NAME`. Only the variable name is uppercased; the value stays unchanged. An unmatched optional capture is empty. Capture names must use ASCII letters, digits, or `_`, be accepted by the regex engine, and not collide after uppercasing.
 
 Quote `"$FILE"` and `"${MATCH_NAME}"`. Commands run with the root as their working directory and with standard input closed. There is no `{{ name }}` template substitution.
+
+For deletion and rename, paths are historical references, not file snapshots: `FILE` and `OLD_FILE` may be absent or reused when commands start. fev validates safe root-relative paths and rejects symlinks in existing components, but does not require historical paths to exist. Do not read them as guaranteed old/new contents.
 
 ### Sequential and parallel execution
 
@@ -283,22 +293,24 @@ Quote `"$FILE"` and `"${MATCH_NAME}"`. Commands run with the root as their worki
 - A `run` array executes sequentially and occupies one concurrency slot for its entire duration.
 - Each array item uses a separate `sh -c`: `cd`, variables, and `export` do not carry over. Use one multiline item when shell state must be shared.
 - A nonzero exit or launch failure stops the remaining array items, without interrupting other matching rules.
-- The same root/key/rule cannot have overlapping command sequences.
+- The same root/key/rule cannot have overlapping command sequences, across all event types. Content updates coalesce; distinct queued deletion/rename occurrences are preserved in their queued order for that root/key/rule, even if later changes invalidate pending content work.
 
 For dependent steps, use one array or separate file patterns for each stage. Output-triggered stages run through OS notifications and `settle`, not directly when the producer exits.
 
 ## State and safety
 
-Successes are stored in `state/ledger.sqlite3` and identified by root id, key, rule id, file size, and nanosecond modification time. Unchanged successful inputs are skipped across restarts. Changing only `run` or `match` does not force replay; update the input or intentionally change the rule id.
+Successes are stored in `state/ledger.sqlite3`. Content events share material-identity deduplication by root id, key, rule id, file size, and nanosecond modification time (`event_id = 0`) across `startup`, `created`, and `updated`. Unchanged successful inputs are skipped across restarts, including successes recorded before startup was split from created; enabling startup does not invalidate them. This split requires no ledger schema change or migration. Deleted/renamed transitions each receive a durable positive occurrence id, so repeated transitions are not suppressed by identical size/mtime. Event kind is recorded for visibility, not as a content-deduplication discriminator. Changing only `run` or `match` does not force content replay; update the input or intentionally change the rule id.
+
+With retained state, the same successful identity was already suppressed on restart. Opting out of startup additionally prevents initial commands even if the ledger is fresh or missing. With startup enabled, deleting/changing the ledger, changing root/rule ids, or a crash before success recording can otherwise cause initial re-execution.
 
 - Commands own output paths and file creation. Outputless jobs are valid; fev does not move or delete inputs automatically.
 - Commands are not sandboxed. Prevent unsafe paths, competing writes, and processing loops in your configuration and commands.
 - `settle` is not a writer-completion guarantee. Direct writes can expose partial outputs to later stages. For completed-file publication, write outside all watched roots on the destination filesystem, then rename into the target root after success.
-- Failure does not roll back files or external effects. Failed identities are not immediately retried in the same process; an input identity change or restart makes them eligible again.
+- Failure does not roll back files or external effects. Failed content identities are not immediately retried in the same process; a matching live identity change makes them eligible again. Restart alone retries failed initial work only for rules subscribed to `startup`. Historical deletion/rename events are not replayed on restart.
 - External effects and ledger recording are not atomic. Operations may run again after a crash; do not rely on exactly-once execution.
 - YAML changes require a restart. Shutdown has no command timeout, so a command that never finishes can keep shutdown waiting.
 
-Legacy `out` configurations are rejected, and `OUT` / `OUT_TMP` are not provided. Old success records without rule ids are archived as `legacy_successes` and do not suppress new jobs; migration can reprocess existing input. Do not run old and new binaries against the same state simultaneously.
+Legacy `out` configurations are rejected, and `OUT` / `OUT_TMP` are not provided. Existing per-rule ledgers are migrated atomically, preserving successes as content records with `event_id = 0`. Older success records without rule ids are atomically archived as `legacy_successes` and do not suppress new jobs; that migration can reprocess existing input. Do not run old and new binaries against the same state simultaneously.
 
 See the [configuration reference](skills/creating-fev-yaml/references/configuration.md) for the full contract.
 
