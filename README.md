@@ -42,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/takemo101/fev/main/install.sh | INS
 Install an exact release tag instead of the latest release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/takemo101/fev/main/install.sh | VERSION=v0.1.0 sh
+curl -fsSL https://raw.githubusercontent.com/takemo101/fev/main/install.sh | VERSION=v0.1.1 sh
 ```
 
 The installer requires `curl`, `tar`, standard POSIX utilities, and either `sha256sum` or `shasum`. It selects the release archive using the host OS and CPU:
